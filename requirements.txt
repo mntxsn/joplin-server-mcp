@@ -1,4 +1,9 @@
 mcp>=1.0.0
-joppy>=1.0.0
+# Pinned: joplin_server_mcp.py monkey-patches joppy internals (verified
+# against 1.0.4). Re-check the patches before bumping this.
+joppy==1.0.4
 pydantic>=2.0.0
+requests>=2.28.0
 httpx>=0.24.0
+# E2EE decryption (joplin_crypto.py): AES-256-GCM via the cryptography library.
+cryptography>=3.4.8

@@ -13,16 +13,23 @@ Environment variables:
     - JOPLIN_SERVER_URL: Server URL (default: http://localhost:22300)
     - JOPLIN_SERVER_EMAIL: User email
     - JOPLIN_SERVER_PASSWORD: User password
+    - JOPLIN_E2EE_PASSWORD: Encryption master password (only needed if the
+      account uses end-to-end encryption)
 """
 
 import json
 import os
 import sys
+import time
+import uuid
+from dataclasses import fields as dc_fields
 from enum import Enum
-from typing import Optional, List, Any
+from typing import Optional
 from datetime import datetime
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
+import requests
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict
 
@@ -30,11 +37,13 @@ from joppy.server_api import ServerApi, LockError
 from joppy import data_types as dt
 
 # Monkey-patch joppy to handle newer Joplin Server fields, NaN timestamps,
-# and fix boolean serialization (Joplin expects 0/1, not False/True)
+# and fix boolean serialization (Joplin expects 0/1, not False/True).
+# Written against joppy 1.0.4 internals - keep the version pinned in
+# requirements.txt in sync when updating.
 
 def _filter_kwargs(dataclass_type, kwargs):
     """Filter kwargs to only include known fields and fix NaN timestamps."""
-    known_fields = {f.name for f in dt.fields(dataclass_type)}
+    known_fields = {f.name for f in dc_fields(dataclass_type)}
     filtered = {}
     for k, v in kwargs.items():
         if k not in known_fields:
@@ -45,32 +54,20 @@ def _filter_kwargs(dataclass_type, kwargs):
         filtered[k] = v
     return filtered
 
-_original_resource_init = dt.ResourceData.__init__
-def _patched_resource_init(self, **kwargs):
-    _original_resource_init(self, **_filter_kwargs(dt.ResourceData, kwargs))
-dt.ResourceData.__init__ = _patched_resource_init
 
-_original_note_init = dt.NoteData.__init__
-def _patched_note_init(self, **kwargs):
-    _original_note_init(self, **_filter_kwargs(dt.NoteData, kwargs))
-dt.NoteData.__init__ = _patched_note_init
+def _make_patched_init(dataclass_type, original_init):
+    def _patched_init(self, **kwargs):
+        original_init(self, **_filter_kwargs(dataclass_type, kwargs))
+    return _patched_init
 
-_original_notebook_init = dt.NotebookData.__init__
-def _patched_notebook_init(self, **kwargs):
-    _original_notebook_init(self, **_filter_kwargs(dt.NotebookData, kwargs))
-dt.NotebookData.__init__ = _patched_notebook_init
 
-_original_tag_init = dt.TagData.__init__
-def _patched_tag_init(self, **kwargs):
-    _original_tag_init(self, **_filter_kwargs(dt.TagData, kwargs))
-dt.TagData.__init__ = _patched_tag_init
+for _dataclass in (dt.ResourceData, dt.NoteData, dt.NotebookData, dt.TagData):
+    _dataclass.__init__ = _make_patched_init(_dataclass, _dataclass.__init__)
+
 
 # Fix NoteData serialization to output 0/1 for boolean fields instead of False/True
-_original_note_serialize = dt.NoteData.serialize
 def _patched_note_serialize(self):
     """Patched serialize that converts booleans to 0/1."""
-    from dataclasses import fields as dc_fields
-
     # Boolean fields that need 0/1 instead of False/True
     bool_fields = {'is_todo', 'is_conflict', 'encryption_applied', 'is_shared'}
 
@@ -80,18 +77,20 @@ def _patched_note_serialize(self):
 
     for field_ in dc_fields(self):
         if field_.name == "id":
+            # joppy's add_note reads note.id after serialize() (and asserts
+            # it is set), so a generated id must be stored on the object.
             if self.id is None:
-                import uuid
                 self.id = uuid.uuid4().hex
             lines.append(f"{field_.name}: {self.id}")
         elif field_.name == "markup_language":
-            if self.markup_language is None:
-                self.markup_language = dt.MarkupLanguage.MARKDOWN
-            lines.append(f"{field_.name}: {int(self.markup_language)}")
+            markup = (
+                self.markup_language
+                if self.markup_language is not None
+                else dt.MarkupLanguage.MARKDOWN
+            )
+            lines.append(f"{field_.name}: {int(markup)}")
         elif field_.name == "source_application":
-            if self.source_application is None:
-                self.source_application = "joppy"
-            lines.append(f"{field_.name}: {self.source_application}")
+            lines.append(f"{field_.name}: {self.source_application or 'joppy'}")
         elif field_.name in ("title", "body"):
             pass  # handled before
         elif field_.name == "type_":
@@ -120,9 +119,19 @@ dt.NoteData.serialize = _patched_note_serialize
 JOPLIN_SERVER_URL = os.getenv("JOPLIN_SERVER_URL", "http://localhost:22300")
 JOPLIN_SERVER_EMAIL = os.getenv("JOPLIN_SERVER_EMAIL", "")
 JOPLIN_SERVER_PASSWORD = os.getenv("JOPLIN_SERVER_PASSWORD", "")
+# Master password for end-to-end encrypted accounts. Empty = E2EE not in use.
+JOPLIN_E2EE_PASSWORD = os.getenv("JOPLIN_E2EE_PASSWORD", "")
+
+_LOCAL_HOSTNAMES = ("localhost", "127.0.0.1", "::1")
 
 # Global API instance (lazy initialized)
 _api: Optional[ServerApi] = None
+
+# Cache for get_all_notes() to avoid re-downloading every note (including
+# bodies) on each list/search call. Invalidated on any write that can
+# change notes.
+_NOTES_CACHE_TTL_SECONDS = 30
+_notes_cache = {"timestamp": 0.0, "notes": None}
 
 # =============================================================================
 # Initialize MCP Server
@@ -151,12 +160,146 @@ def _get_api() -> ServerApi:
     return _api
 
 
+# =============================================================================
+# End-to-end encryption (E2EE) decryption
+# =============================================================================
+#
+# joppy has no decryption support: its deserialize() raises "Encryption is not
+# supported" the moment it meets an encrypted item. When JOPLIN_E2EE_PASSWORD is
+# set we transparently decrypt items before joppy parses them, so every read
+# tool works against E2EE accounts. See joplin_crypto for the crypto details.
+
+import joplin_crypto as _jc
+from joppy import server_api as _joppy_server_api
+
+# Decrypted master keys (id -> key), fetched and unwrapped once per process.
+_master_key_store: Optional[dict] = None
+
+
+class E2EEError(Exception):
+    """Encrypted data was found but could not be decrypted (config problem)."""
+
+
+def _get_master_key_store() -> dict:
+    """Fetch the server's master keys and decrypt them with the master password.
+
+    Cached after the first successful build. Raises E2EEError (surfaced to the
+    user) when the password is missing or wrong.
+    """
+    global _master_key_store
+    if _master_key_store is not None:
+        return _master_key_store
+    if not JOPLIN_E2EE_PASSWORD:
+        raise E2EEError(
+            "This data is end-to-end encrypted. Set JOPLIN_E2EE_PASSWORD to "
+            "your Joplin encryption master password to read it."
+        )
+    # info.json is lock-exempt in joppy, so this is safe to fetch here.
+    info = _get_api().get("/api/items/root:/info.json:/content").json()
+    store = _jc.build_master_key_store(
+        info.get("masterKeys", []), JOPLIN_E2EE_PASSWORD
+    )
+    if not store:
+        raise E2EEError(
+            "Could not decrypt any master key - is JOPLIN_E2EE_PASSWORD correct?"
+        )
+    _master_key_store = store
+    return store
+
+
+def _extract_cipher_text(body: str) -> Optional[str]:
+    """Pull the encryption_cipher_text value out of a serialized item body."""
+    for line in body.split("\n"):
+        if line.startswith("encryption_cipher_text: "):
+            return line[len("encryption_cipher_text: "):] or None
+    return None
+
+
+_original_deserialize = _joppy_server_api.deserialize
+
+
+def _patched_deserialize(body):
+    """Decrypt E2EE items before handing them to joppy's deserialize.
+
+    An encrypted item's cleartext body carries `encryption_applied: 1` and an
+    `encryption_cipher_text: JED01...` blob holding the real serialized item. We
+    decrypt the blob and let joppy parse the plaintext. Items that can't be
+    turned into a known type (e.g. revision diffs) return None, mirroring
+    joppy's own handling of revisions, so a single odd item never aborts a list.
+    """
+    if body and "encryption_applied: 1" in body:
+        cipher = _extract_cipher_text(body)
+        if cipher and cipher.startswith("JED"):
+            store = _get_master_key_store()  # E2EEError bubbles up on misconfig
+            try:
+                body = _jc.decrypt_cipher_text(cipher, store)
+            except _jc.JoplinCryptoError:
+                # One undecryptable item shouldn't break a whole listing.
+                return None
+    try:
+        return _original_deserialize(body)
+    except (KeyError, ValueError):
+        return None
+
+
+_joppy_server_api.deserialize = _patched_deserialize
+
+
 @contextmanager
 def _with_lock():
-    """Context manager to acquire sync lock for operations."""
+    """Context manager to acquire the Joplin Server sync lock.
+
+    joppy's ServerApi requires an active sync lock for *every* request except
+    login/lock/info (see server_api.py _request). That includes read-only
+    operations like get_all_notebooks, so both read and write tools must run
+    inside this context. The lock is released on exit, including on error.
+    """
     api = _get_api()
     with api.sync_lock():
         yield api
+
+
+def _sanitize_error_message(e: Exception) -> str:
+    """Return an error message with credentials scrubbed."""
+    message = str(e)
+    if JOPLIN_SERVER_PASSWORD:
+        message = message.replace(JOPLIN_SERVER_PASSWORD, "***")
+    return message
+
+
+def _tool_error(e: Exception) -> str:
+    """Format an exception as a JSON error response for tool output."""
+    if isinstance(e, LockError):
+        return json.dumps({
+            "error": "Could not acquire the Joplin Server sync lock. Another "
+                     "client is probably syncing right now - try again shortly."
+        }, indent=2)
+    return json.dumps({"error": _sanitize_error_message(e)}, indent=2)
+
+
+def _sanitize_title(title: str) -> str:
+    """Collapse newlines in titles.
+
+    Joplin's raw item format is line-based with the title on the first line;
+    embedded newlines would corrupt the serialized item.
+    """
+    return " ".join(title.splitlines())
+
+
+def _get_all_notes_cached(api) -> list:
+    """Return all notes, using a short-lived cache to avoid full re-downloads."""
+    now = time.monotonic()
+    if (
+        _notes_cache["notes"] is None
+        or now - _notes_cache["timestamp"] > _NOTES_CACHE_TTL_SECONDS
+    ):
+        _notes_cache["notes"] = api.get_all_notes()
+        _notes_cache["timestamp"] = now
+    return _notes_cache["notes"]
+
+
+def _invalidate_notes_cache() -> None:
+    _notes_cache["notes"] = None
 
 
 def _format_timestamp(dt_obj: Optional[datetime]) -> str:
@@ -246,6 +389,7 @@ class ListNotesInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     folder_id: Optional[str] = Field(default=None, description="Filter notes by notebook ID")
+    limit: int = Field(default=100, ge=1, le=1000, description="Maximum number of notes to return")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
@@ -253,6 +397,7 @@ class SearchNotesInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     query: str = Field(..., description="Search query (searches in title and body)", min_length=1)
+    limit: int = Field(default=100, ge=1, le=1000, description="Maximum number of results to return")
     response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
@@ -316,22 +461,24 @@ def joplin_create_note(params: CreateNoteInput) -> str:
         JSON with created note ID and details
     """
     try:
+        title = _sanitize_title(params.title)
         with _with_lock() as api:
             # Convert boolean to int for Joplin compatibility
             note_id = api.add_note(
                 parent_id=params.parent_id,
-                title=params.title,
+                title=title,
                 body=params.body,
                 is_todo=1 if params.is_todo else 0,
             )
+            _invalidate_notes_cache()
             return json.dumps({
                 "success": True,
                 "note_id": note_id,
-                "title": params.title,
-                "message": f"Note '{params.title}' created successfully"
+                "title": title,
+                "message": f"Note '{title}' created successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -354,29 +501,29 @@ def joplin_get_note(params: GetNoteInput) -> str:
         with _with_lock() as api:
             note = api.get_note(params.note_id)
 
-            if params.response_format == ResponseFormat.JSON:
-                return json.dumps(_note_to_dict(note), indent=2)
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps(_note_to_dict(note), indent=2)
 
-            # Markdown format
-            lines = [
-                f"# {note.title or 'Untitled'}",
-                "",
-                f"**ID:** `{note.id}`",
-                f"**Created:** {_format_timestamp(note.created_time)}",
-                f"**Updated:** {_format_timestamp(note.updated_time)}",
-            ]
+        # Markdown format
+        lines = [
+            f"# {note.title or 'Untitled'}",
+            "",
+            f"**ID:** `{note.id}`",
+            f"**Created:** {_format_timestamp(note.created_time)}",
+            f"**Updated:** {_format_timestamp(note.updated_time)}",
+        ]
 
-            if note.is_todo:
-                status = "Completed" if note.todo_completed else "Pending"
-                lines.append(f"**Todo Status:** {status}")
+        if note.is_todo:
+            status = "Completed" if note.todo_completed else "Pending"
+            lines.append(f"**Todo Status:** {status}")
 
-            if note.parent_id:
-                lines.append(f"**Notebook ID:** `{note.parent_id}`")
+        if note.parent_id:
+            lines.append(f"**Notebook ID:** `{note.parent_id}`")
 
-            lines.extend(["", "---", "", note.body or ""])
-            return "\n".join(lines)
+        lines.extend(["", "---", "", note.body or ""])
+        return "\n".join(lines)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -398,7 +545,7 @@ def joplin_update_note(params: UpdateNoteInput) -> str:
     try:
         update_data = {}
         if params.title is not None:
-            update_data["title"] = params.title
+            update_data["title"] = _sanitize_title(params.title)
         if params.body is not None:
             update_data["body"] = params.body
         if params.parent_id is not None:
@@ -409,13 +556,14 @@ def joplin_update_note(params: UpdateNoteInput) -> str:
 
         with _with_lock() as api:
             api.modify_note(params.note_id, **update_data)
+            _invalidate_notes_cache()
             return json.dumps({
                 "success": True,
                 "note_id": params.note_id,
                 "message": "Note updated successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -438,12 +586,13 @@ def joplin_delete_note(params: DeleteNoteInput) -> str:
     try:
         with _with_lock() as api:
             api.delete_note(params.note_id)
+            _invalidate_notes_cache()
             return json.dumps({
                 "success": True,
                 "message": "Note deleted successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -454,46 +603,53 @@ def joplin_delete_note(params: DeleteNoteInput) -> str:
     }
 )
 def joplin_list_notes(params: ListNotesInput) -> str:
-    """List all notes, optionally filtered by notebook.
+    """List notes, optionally filtered by notebook.
 
     Args:
-        params: ListNotesInput with optional folder_id and response_format
+        params: ListNotesInput with optional folder_id, limit and response_format
 
     Returns:
         List of notes in requested format
     """
     try:
         with _with_lock() as api:
-            all_notes = api.get_all_notes()
+            all_notes = _get_all_notes_cached(api)
 
-            # Filter by folder if specified
-            if params.folder_id:
-                all_notes = [n for n in all_notes if n.parent_id == params.folder_id]
+        # Filter by folder if specified
+        if params.folder_id:
+            all_notes = [n for n in all_notes if n.parent_id == params.folder_id]
 
-            if params.response_format == ResponseFormat.JSON:
-                return json.dumps({
-                    "items": [_note_to_dict(n) for n in all_notes],
-                    "count": len(all_notes)
-                }, indent=2)
+        total = len(all_notes)
+        notes = all_notes[:params.limit]
 
-            # Markdown format
-            lines = ["# Notes", ""]
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({
+                "items": [_note_to_dict(n) for n in notes],
+                "count": len(notes),
+                "total": total,
+            }, indent=2)
 
-            if not all_notes:
-                lines.append("*No notes found*")
-            else:
-                for note in all_notes:
-                    prefix = ""
-                    if note.is_todo:
-                        prefix = "[x] " if note.todo_completed else "[ ] "
-                    lines.append(f"- {prefix}**{note.title or 'Untitled'}**")
-                    lines.append(f"  - ID: `{note.id}`")
-                    lines.append(f"  - Updated: {_format_timestamp(note.updated_time)}")
+        # Markdown format
+        lines = ["# Notes", ""]
 
-            lines.append(f"\n*Total: {len(all_notes)} notes*")
-            return "\n".join(lines)
+        if not notes:
+            lines.append("*No notes found*")
+        else:
+            for note in notes:
+                prefix = ""
+                if note.is_todo:
+                    prefix = "[x] " if note.todo_completed else "[ ] "
+                lines.append(f"- {prefix}**{note.title or 'Untitled'}**")
+                lines.append(f"  - ID: `{note.id}`")
+                lines.append(f"  - Updated: {_format_timestamp(note.updated_time)}")
+
+        if total > len(notes):
+            lines.append(f"\n*Showing {len(notes)} of {total} notes (increase `limit` for more)*")
+        else:
+            lines.append(f"\n*Total: {total} notes*")
+        return "\n".join(lines)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -510,45 +666,52 @@ def joplin_search_notes(params: SearchNotesInput) -> str:
     a native search API.
 
     Args:
-        params: SearchNotesInput with query and response_format
+        params: SearchNotesInput with query, limit and response_format
 
     Returns:
         Matching notes in requested format
     """
     try:
         with _with_lock() as api:
-            all_notes = api.get_all_notes()
-            query_lower = params.query.lower()
+            all_notes = _get_all_notes_cached(api)
+        query_lower = params.query.lower()
 
-            # Client-side search
-            matches = []
-            for note in all_notes:
-                title_match = note.title and query_lower in note.title.lower()
-                body_match = note.body and query_lower in note.body.lower()
-                if title_match or body_match:
-                    matches.append(note)
+        # Client-side search
+        matches = []
+        for note in all_notes:
+            title_match = note.title and query_lower in note.title.lower()
+            body_match = note.body and query_lower in note.body.lower()
+            if title_match or body_match:
+                matches.append(note)
 
-            if params.response_format == ResponseFormat.JSON:
-                return json.dumps({
-                    "query": params.query,
-                    "items": [_note_to_dict(n) for n in matches],
-                    "count": len(matches)
-                }, indent=2)
+        total = len(matches)
+        matches = matches[:params.limit]
 
-            # Markdown format
-            lines = [f"# Search Results for '{params.query}'", ""]
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({
+                "query": params.query,
+                "items": [_note_to_dict(n) for n in matches],
+                "count": len(matches),
+                "total": total,
+            }, indent=2)
 
-            if not matches:
-                lines.append("*No results found*")
-            else:
-                for note in matches:
-                    lines.append(f"- **{note.title or 'Untitled'}**")
-                    lines.append(f"  - ID: `{note.id}`")
+        # Markdown format
+        lines = [f"# Search Results for '{params.query}'", ""]
 
-            lines.append(f"\n*Found {len(matches)} matching notes*")
-            return "\n".join(lines)
+        if not matches:
+            lines.append("*No results found*")
+        else:
+            for note in matches:
+                lines.append(f"- **{note.title or 'Untitled'}**")
+                lines.append(f"  - ID: `{note.id}`")
+
+        if total > len(matches):
+            lines.append(f"\n*Showing {len(matches)} of {total} matching notes (increase `limit` for more)*")
+        else:
+            lines.append(f"\n*Found {total} matching notes*")
+        return "\n".join(lines)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 # =============================================================================
@@ -572,8 +735,9 @@ def joplin_create_folder(params: CreateFolderInput) -> str:
         JSON with created notebook details
     """
     try:
+        title = _sanitize_title(params.title)
         with _with_lock() as api:
-            kwargs = {"title": params.title}
+            kwargs = {"title": title}
             if params.parent_id:
                 kwargs["parent_id"] = params.parent_id
 
@@ -581,11 +745,11 @@ def joplin_create_folder(params: CreateFolderInput) -> str:
             return json.dumps({
                 "success": True,
                 "folder_id": folder_id,
-                "title": params.title,
-                "message": f"Notebook '{params.title}' created successfully"
+                "title": title,
+                "message": f"Notebook '{title}' created successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -608,24 +772,24 @@ def joplin_list_folders(params: ListFoldersInput) -> str:
         with _with_lock() as api:
             all_folders = api.get_all_notebooks()
 
-            if params.response_format == ResponseFormat.JSON:
-                return json.dumps({
-                    "folders": [_notebook_to_dict(f) for f in all_folders]
-                }, indent=2)
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({
+                "folders": [_notebook_to_dict(f) for f in all_folders]
+            }, indent=2)
 
-            # Markdown format
-            lines = ["# Notebooks", ""]
+        # Markdown format
+        lines = ["# Notebooks", ""]
 
-            if not all_folders:
-                lines.append("*No notebooks found*")
-            else:
-                for folder in all_folders:
-                    lines.append(f"- **{folder.title or 'Untitled'}**")
-                    lines.append(f"  - ID: `{folder.id}`")
+        if not all_folders:
+            lines.append("*No notebooks found*")
+        else:
+            for folder in all_folders:
+                lines.append(f"- **{folder.title or 'Untitled'}**")
+                lines.append(f"  - ID: `{folder.id}`")
 
-            return "\n".join(lines)
+        return "\n".join(lines)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -648,12 +812,13 @@ def joplin_delete_folder(params: DeleteFolderInput) -> str:
     try:
         with _with_lock() as api:
             api.delete_notebook(params.folder_id)
+            _invalidate_notes_cache()
             return json.dumps({
                 "success": True,
                 "message": "Notebook deleted successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 # =============================================================================
@@ -677,16 +842,17 @@ def joplin_create_tag(params: CreateTagInput) -> str:
         JSON with created tag details
     """
     try:
+        title = _sanitize_title(params.title)
         with _with_lock() as api:
-            tag_id = api.add_tag(title=params.title)
+            tag_id = api.add_tag(title=title)
             return json.dumps({
                 "success": True,
                 "tag_id": tag_id,
-                "title": params.title,
-                "message": f"Tag '{params.title}' created successfully"
+                "title": title,
+                "message": f"Tag '{title}' created successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -709,23 +875,23 @@ def joplin_list_tags(params: ListTagsInput) -> str:
         with _with_lock() as api:
             all_tags = api.get_all_tags()
 
-            if params.response_format == ResponseFormat.JSON:
-                return json.dumps({
-                    "tags": [_tag_to_dict(t) for t in all_tags]
-                }, indent=2)
+        if params.response_format == ResponseFormat.JSON:
+            return json.dumps({
+                "tags": [_tag_to_dict(t) for t in all_tags]
+            }, indent=2)
 
-            # Markdown format
-            lines = ["# Tags", ""]
+        # Markdown format
+        lines = ["# Tags", ""]
 
-            if not all_tags:
-                lines.append("*No tags found*")
-            else:
-                for tag in all_tags:
-                    lines.append(f"- **{tag.title or 'Untitled'}** (`{tag.id}`)")
+        if not all_tags:
+            lines.append("*No tags found*")
+        else:
+            for tag in all_tags:
+                lines.append(f"- **{tag.title or 'Untitled'}** (`{tag.id}`)")
 
-            return "\n".join(lines)
+        return "\n".join(lines)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 @mcp.tool(
@@ -752,7 +918,7 @@ def joplin_add_tag_to_note(params: AddTagToNoteInput) -> str:
                 "message": "Tag added to note successfully"
             }, indent=2)
     except Exception as e:
-        return json.dumps({"error": str(e)}, indent=2)
+        return _tool_error(e)
 
 
 # =============================================================================
@@ -772,31 +938,40 @@ def joplin_ping() -> str:
     Returns:
         JSON with connection status
     """
-    import requests
     try:
         # Direct ping without going through joppy (avoids lock requirement)
         response = requests.get(f"{JOPLIN_SERVER_URL}/api/ping", timeout=10)
-        if response.status_code == 200:
-            # Also verify we can authenticate
-            api = _get_api()
+        if response.status_code != 200:
             return json.dumps({
-                "connected": True,
-                "authenticated": True,
-                "url": JOPLIN_SERVER_URL,
-                "user": JOPLIN_SERVER_EMAIL,
-                "message": "Joplin Server is accessible and authenticated"
-            }, indent=2)
-        else:
-            return json.dumps({
-                "connected": True,
+                "connected": False,
                 "authenticated": False,
                 "error": f"Server responded with status {response.status_code}"
             }, indent=2)
     except Exception as e:
         return json.dumps({
             "connected": False,
+            "authenticated": False,
             "error": str(e)
         }, indent=2)
+
+    # Server is reachable - verify authentication separately so login
+    # failures aren't reported as connection failures.
+    try:
+        _get_api()
+    except Exception as e:
+        return json.dumps({
+            "connected": True,
+            "authenticated": False,
+            "url": JOPLIN_SERVER_URL,
+            "error": _sanitize_error_message(e)
+        }, indent=2)
+
+    return json.dumps({
+        "connected": True,
+        "authenticated": True,
+        "url": JOPLIN_SERVER_URL,
+        "message": "Joplin Server is accessible and authenticated"
+    }, indent=2)
 
 
 # =============================================================================
@@ -810,6 +985,15 @@ if __name__ == "__main__":
             "Set them with:\n"
             "  export JOPLIN_SERVER_EMAIL='your-email'\n"
             "  export JOPLIN_SERVER_PASSWORD='your-password'\n",
+            file=sys.stderr
+        )
+
+    _parsed_url = urlparse(JOPLIN_SERVER_URL)
+    if _parsed_url.scheme == "http" and _parsed_url.hostname not in _LOCAL_HOSTNAMES:
+        print(
+            f"WARNING: JOPLIN_SERVER_URL ({JOPLIN_SERVER_URL}) uses plain HTTP "
+            "to a non-local host. Credentials and note contents will be sent "
+            "unencrypted - use https:// for remote servers.\n",
             file=sys.stderr
         )
 
