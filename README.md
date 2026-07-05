@@ -204,7 +204,7 @@ Because these patches touch joppy internals, the joppy version is pinned in `req
 
 Other implementation details:
 
-- The Joplin sync lock is only acquired for write operations; reads run without it, so they don't collide with syncing Joplin clients. If another client holds the lock during a write, the tool returns a clear "try again shortly" error.
+- The Joplin sync lock is acquired for every operation, reads included: joppy's `ServerApi` requires an active lock for each request. The lock is held only for the duration of the request and released immediately after. If another client holds it, the tool returns a clear "try again shortly" error.
 - Note listings and searches use a short-lived (30 s) in-memory cache of all notes, invalidated by any write, to avoid re-downloading every note body on each call.
 
 ## Security
@@ -219,4 +219,10 @@ MIT License
 
 ## Author
 
-Erick Toussaint (@erickt23)
+@mntxsn
+
+## Acknowledgments
+
+This project is a fork of [erickt23/joplin-server-mcp](https://github.com/erickt23/joplin-server-mcp)
+by Erick Toussaint (@erickt23). It adds end-to-end encryption (E2EE) read
+support and fixes sync-lock handling on read tools.
