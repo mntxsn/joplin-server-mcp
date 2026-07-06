@@ -9,11 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- End-to-end encryption (E2EE) support for reading. When `JOPLIN_E2EE_PASSWORD`
-  is set, encrypted items are transparently decrypted before use, so all read
-  tools work against encrypted accounts. Implements Joplin's modern AES-256-GCM
-  methods (KeyV1/FileV1/StringV1) in `joplin_crypto.py`. Clear errors are
-  returned when the password is missing or wrong.
+- End-to-end encryption (E2EE) support for both reading and writing. When
+  `JOPLIN_E2EE_PASSWORD` is set, encrypted items are transparently decrypted
+  before use, and items created/updated through the write tools are encrypted
+  with the account's active master key before upload - so notes, notebooks, and
+  tags are never written in plaintext to an encrypted store. Writes are only
+  encrypted when the account actually has E2EE enabled (detected from the sync
+  target's `info.json`); otherwise they stay plaintext. Implements Joplin's
+  modern AES-256-GCM methods (KeyV1/FileV1/StringV1) in `joplin_crypto.py`, with
+  clear errors when the password is missing or wrong.
 
 ### Fixed
 
@@ -25,9 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Known limitations
 
-- Writing to E2EE accounts is not encrypted: created/updated notes are stored
-  unencrypted (a real Joplin client re-encrypts them on next sync). Read-only
-  use is unaffected.
+- Resource/attachment content is not encrypted on write (there is no
+  resource-creation tool; file content uses a separate encryption method).
+- Notes created through the write tools do not set `created_time`/`updated_time`
+  (unchanged from before E2EE); Joplin fills these in on its side.
 
 ## [0.2.0] - 2026-07-05
 

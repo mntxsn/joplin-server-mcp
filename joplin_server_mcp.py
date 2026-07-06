@@ -161,23 +161,50 @@ def _get_api() -> ServerApi:
 
 
 # =============================================================================
-# End-to-end encryption (E2EE) decryption
+# End-to-end encryption (E2EE)
 # =============================================================================
 #
-# joppy has no decryption support: its deserialize() raises "Encryption is not
-# supported" the moment it meets an encrypted item. When JOPLIN_E2EE_PASSWORD is
-# set we transparently decrypt items before joppy parses them, so every read
-# tool works against E2EE accounts. See joplin_crypto for the crypto details.
+# joppy has no encryption support: its deserialize() raises "Encryption is not
+# supported" on encrypted items, and its serialize() only ever emits plaintext.
+# When JOPLIN_E2EE_PASSWORD is set we transparently decrypt items before joppy
+# parses them (reads) and encrypt items before joppy uploads them (writes), so
+# every tool works against E2EE accounts. Writes are only encrypted when the
+# account actually has E2EE enabled - see _e2ee_active(). Crypto lives in
+# joplin_crypto.
 
 import joplin_crypto as _jc
 from joppy import server_api as _joppy_server_api
 
 # Decrypted master keys (id -> key), fetched and unwrapped once per process.
 _master_key_store: Optional[dict] = None
+# Cached sync target info (info.json): E2EE flag + active master key id.
+_sync_info: Optional[dict] = None
 
 
 class E2EEError(Exception):
-    """Encrypted data was found but could not be decrypted (config problem)."""
+    """Encrypted data was found but could not be de/encrypted (config problem)."""
+
+
+def _get_sync_info() -> dict:
+    """Fetch and cache the sync target's info.json (lock-exempt in joppy)."""
+    global _sync_info
+    if _sync_info is None:
+        _sync_info = _get_api().get(
+            "/api/items/root:/info.json:/content"
+        ).json()
+    return _sync_info
+
+
+def _e2ee_active() -> bool:
+    """Whether the account has E2EE enabled with an active master key."""
+    info = _get_sync_info()
+    return bool(info.get("e2ee", {}).get("value")) and bool(
+        info.get("activeMasterKeyId", {}).get("value")
+    )
+
+
+def _active_master_key_id() -> Optional[str]:
+    return _get_sync_info().get("activeMasterKeyId", {}).get("value")
 
 
 def _get_master_key_store() -> dict:
@@ -192,12 +219,10 @@ def _get_master_key_store() -> dict:
     if not JOPLIN_E2EE_PASSWORD:
         raise E2EEError(
             "This data is end-to-end encrypted. Set JOPLIN_E2EE_PASSWORD to "
-            "your Joplin encryption master password to read it."
+            "your Joplin encryption master password to read or write it."
         )
-    # info.json is lock-exempt in joppy, so this is safe to fetch here.
-    info = _get_api().get("/api/items/root:/info.json:/content").json()
     store = _jc.build_master_key_store(
-        info.get("masterKeys", []), JOPLIN_E2EE_PASSWORD
+        _get_sync_info().get("masterKeys", []), JOPLIN_E2EE_PASSWORD
     )
     if not store:
         raise E2EEError(
@@ -243,6 +268,45 @@ def _patched_deserialize(body):
 
 
 _joppy_server_api.deserialize = _patched_deserialize
+
+
+def _maybe_encrypt_item(plaintext: str) -> str:
+    """Encrypt a serialized item before upload, if the account uses E2EE.
+
+    When E2EE is not active the plaintext is returned unchanged (normal write).
+    When it is active, the item is encrypted with the active master key so we
+    never write plaintext into an encrypted store; a missing/wrong password
+    raises E2EEError instead of silently leaking plaintext.
+    """
+    if not _e2ee_active():
+        return plaintext
+    store = _get_master_key_store()  # E2EEError on missing/wrong password
+    mkid = _active_master_key_id()
+    key = store.get(mkid)
+    if key is None:
+        raise E2EEError(
+            f"Active master key {mkid} could not be decrypted; check "
+            f"JOPLIN_E2EE_PASSWORD."
+        )
+    return _jc.build_encrypted_item(plaintext, mkid, key)
+
+
+def _wrap_serialize_with_e2ee(dataclass_type) -> None:
+    """Make a dataclass's serialize() encrypt its output when E2EE is active."""
+    original_serialize = dataclass_type.serialize
+
+    def _serialize(self):
+        return _maybe_encrypt_item(original_serialize(self))
+
+    dataclass_type.serialize = _serialize
+
+
+# Wrap the writable text item types. NoteData.serialize is already patched
+# above; wrapping it here layers encryption on top of that plaintext output.
+# Resources are intentionally excluded (no resource-creation tool, and file
+# content uses a different encryption method).
+for _dataclass in (dt.NoteData, dt.NotebookData, dt.TagData, dt.NoteTagData):
+    _wrap_serialize_with_e2ee(_dataclass)
 
 
 @contextmanager

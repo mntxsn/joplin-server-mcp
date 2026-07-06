@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -207,3 +208,102 @@ def build_master_key_store(
         except JoplinCryptoError:
             continue
     return store
+
+
+# =============================================================================
+# Encryption (writing)
+# =============================================================================
+
+# Fields kept in cleartext in an encrypted item's sync envelope. Mirrors
+# Joplin's BaseItem.serializeForSync keepKeys: foreign keys and the timestamp
+# needed to link and synchronise items. Everything else lives in the cipher.
+_ENVELOPE_KEEP_KEYS = frozenset({
+    "id", "note_id", "tag_id", "parent_id", "share_id", "updated_time",
+    "deleted_time", "type_", "is_locked", "extracted_resource_ids",
+})
+
+
+def _str_to_plaintext(text: str, method: int) -> bytes:
+    """Encode a string to the plaintext bytes a given method encrypts."""
+    if method == METHOD_STRING_V1:
+        return text.encode("utf-16-le")
+    if method == METHOD_FILE_V1:
+        return text.encode("utf-8")
+    raise UnsupportedEncryptionMethod(method)
+
+
+def _encrypt_result(plaintext: bytes, password: bytes, method: int) -> dict:
+    """Encrypt bytes into an EncryptionResult dict {salt, iv, ct} (all base64).
+
+    A fresh random salt and 96-bit IV are generated per call. `ct` is the
+    AES-256-GCM ciphertext with the 16-byte auth tag appended, matching how
+    Joplin (and our decryptor) read it back.
+    """
+    if method not in _PBKDF2_ITERATIONS:
+        raise UnsupportedEncryptionMethod(method)
+    salt = os.urandom(32)
+    iv = os.urandom(12)
+    key = _pbkdf2(password, salt, method)
+    ct = AESGCM(key).encrypt(iv, plaintext, None)
+    return {
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "iv": base64.b64encode(iv).decode("ascii"),
+        "ct": base64.b64encode(ct).decode("ascii"),
+    }
+
+
+def encrypt_cipher_text(
+    plaintext_item: str,
+    master_key_id: str,
+    master_key: str,
+    method: int = METHOD_STRING_V1,
+) -> str:
+    """Encrypt a serialized item into a JED01 blob (single chunk).
+
+    master_key is the decrypted master key (hex string) used as the PBKDF2
+    password, exactly as on the decryption side.
+    """
+    password = master_key.encode("utf-8")
+    result = _encrypt_result(
+        _str_to_plaintext(plaintext_item, method), password, method
+    )
+    chunk = json.dumps(result, separators=(",", ":"))
+    metadata = f"{method:02x}{master_key_id}"
+    header = f"{_HEADER_IDENTIFIER}{len(metadata):06x}{metadata}"
+    return f"{header}{len(chunk):06x}{chunk}"
+
+
+def build_encrypted_item(
+    plaintext_item: str, master_key_id: str, master_key: str
+) -> str:
+    """Turn a plaintext serialized item into its encrypted sync envelope.
+
+    The full plaintext item goes into `encryption_cipher_text`; the envelope
+    keeps only the cleartext keepKeys (real values) and blanks everything else,
+    mirroring how Joplin stores encrypted items so real Joplin clients can read
+    them back.
+    """
+    cipher = encrypt_cipher_text(plaintext_item, master_key_id, master_key)
+    parts = plaintext_item.rsplit("\n\n", 1)
+    metadata = parts[1] if len(parts) > 1 else parts[0]
+
+    lines: List[str] = []
+    seen_applied = seen_cipher = False
+    for line in metadata.split("\n"):
+        key = line.split(": ", 1)[0]
+        if key == "encryption_applied":
+            lines.append("encryption_applied: 1")
+            seen_applied = True
+        elif key == "encryption_cipher_text":
+            lines.append(f"encryption_cipher_text: {cipher}")
+            seen_cipher = True
+        elif key in _ENVELOPE_KEEP_KEYS:
+            lines.append(line)
+        else:
+            lines.append(f"{key}: ")
+    # serialize() omits None fields, so these may be absent - always emit them.
+    if not seen_cipher:
+        lines.append(f"encryption_cipher_text: {cipher}")
+    if not seen_applied:
+        lines.append("encryption_applied: 1")
+    return "\n".join(lines)

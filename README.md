@@ -8,7 +8,7 @@ A Model Context Protocol (MCP) server for interacting with a self-hosted Joplin 
 - Manage notebooks (folders)
 - Manage tags
 - Search notes (client-side)
-- Read end-to-end encrypted (E2EE) accounts by setting `JOPLIN_E2EE_PASSWORD`
+- Read and write end-to-end encrypted (E2EE) accounts by setting `JOPLIN_E2EE_PASSWORD`
 - Standard stdio MCP server — works with Claude Code, Continue.dev, opencode, and other MCP clients
 
 ## Prerequisites
@@ -104,7 +104,7 @@ Add the server to `opencode.json` in your project (or globally in `~/.config/ope
 
 **Tip:** Instead of putting credentials in every client config, you can set the three environment variables once in your shell profile and omit the `env`/`environment` blocks — the server reads them from its environment either way.
 
-**End-to-end encryption:** If your Joplin account uses E2EE, also set `JOPLIN_E2EE_PASSWORD` to your encryption master password (this is separate from your login password). The server then transparently decrypts notes, notebooks, and tags for reading. Without it, read tools return a clear "this data is end-to-end encrypted" error. Note: writes are not re-encrypted — a real Joplin client re-encrypts newly created/updated notes on its next sync.
+**End-to-end encryption:** If your Joplin account uses E2EE, also set `JOPLIN_E2EE_PASSWORD` to your encryption master password (this is separate from your login password). The server then transparently decrypts items for reading and encrypts them for writing, so notes, notebooks, and tags are read and stored fully encrypted with your account's active master key. Encryption on write only kicks in when the account actually has E2EE enabled — otherwise writes stay plaintext. Without the password, tools return a clear "this data is end-to-end encrypted" error rather than leaking or corrupting data.
 
 **Note on confirmations:** The tools declare MCP annotations (`readOnlyHint`, `destructiveHint`), but not every client honors them. Clients other than Claude Code may prompt differently — or not at all — before destructive operations like `joplin_delete_note` or `joplin_delete_folder`.
 
@@ -224,5 +224,5 @@ MIT License
 ## Acknowledgments
 
 This project is a fork of [erickt23/joplin-server-mcp](https://github.com/erickt23/joplin-server-mcp)
-by Erick Toussaint (@erickt23). It adds end-to-end encryption (E2EE) read
-support and fixes sync-lock handling on read tools.
+by Erick Toussaint (@erickt23). It adds end-to-end encryption (E2EE) read and
+write support and fixes sync-lock handling on read tools.
